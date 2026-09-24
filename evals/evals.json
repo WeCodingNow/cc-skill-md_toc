@@ -1,0 +1,23 @@
+{
+  "skill_name": "md-toc",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Write a design doc at docs/cache-eviction.md for a new LRU cache eviction policy in our storage engine. Cover the motivation, the eviction algorithm (with subsections for the clock hand and the admission filter), configuration knobs, metrics we should emit, a rollout plan and open questions. Two or three paragraphs per section is plenty; invent reasonable details.",
+      "expected_output": "docs/cache-eviction.md with an H1, an intro, a nested bullet list of links to every H2/H3 right under the H1, and the sections; the ToC anchors match the headings (verify with scripts/check_toc.py).",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "In docs/rollout.md, add a new section '## Rollback procedure' after '## Rollout plan' with three numbered steps, and rename the '## Monitoring' section to '## Monitoring and alerts'. Keep everything else as it is.",
+      "expected_output": "The two heading changes are made, and the ToC under the H1 gains a link to #rollback-procedure and its Monitoring link now reads Monitoring and alerts pointing at #monitoring-and-alerts; no other content changes.",
+      "files": ["docs/rollout.md"]
+    },
+    {
+      "id": 3,
+      "prompt": "Create notes/meeting-2026-09-24.md with a short write-up of today's sync: attendees, three decisions, and action items, each under its own heading. It's just meeting notes, it does not need a table of contents.",
+      "expected_output": "The file is written without a ToC and records the exemption with `<!-- toc: off -->` (or `toc: false` in frontmatter if it has one), so the hook stays silent; the agent does not add a ToC against the user's word.",
+      "files": []
+    }
+  ]
+}
