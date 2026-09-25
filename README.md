@@ -29,7 +29,7 @@ The skill lives in this repository and is linked into the skills directory
 like the other skills here:
 
 ```
-ln -s ~/Code/cc/skill-md-toc ~/.claude/skills/md-toc
+ln -s ~/Code/cc/skill-md_toc ~/.claude/skills/md-toc
 ```
 
 No dependencies beyond Python 3.10+. The hook commands in `SKILL.md` name
