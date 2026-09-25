@@ -1,6 +1,6 @@
 ---
 name: md-toc
-description: Keeps a table of contents in every markdown document that has sections — design docs, specs, research notes, plans, READMEs, runbooks, anything under .spec/ or .spec-inbox/ or any other .md with an H1 and several headings. Use this skill whenever you create or edit a markdown file, add, rename or remove a heading, or restructure a document, even if nobody mentions a ToC. It wires a hook that checks every written .md file and tells you what the ToC is missing; the only way a file legitimately has no ToC is that the user said it does not need one.
+description: Keeps a table of contents in every markdown document that has sections — design docs, specs, research notes, plans, READMEs, runbooks, anything under .spec/ or .spec-inbox/ or any other .md with an H1 and several headings. Use this skill whenever you create or edit a markdown file, add, rename or remove a heading, or restructure a document, even if nobody mentions a ToC. It wires hooks that check every .md file you wrote once you finish your turn and tell you what the ToC is missing; the only way a file legitimately has no ToC is that the user said it does not need one.
 paths:
   - "**/*.md"
 hooks:
@@ -9,6 +9,10 @@ hooks:
       hooks:
         - type: command
           command: python3 "${HOME}/.claude/skills/md-toc/scripts/check_toc.py" --hook
+  Stop:
+    - hooks:
+        - type: command
+          command: python3 "${HOME}/.claude/skills/md-toc/scripts/check_toc.py" --stop-hook
 
 ---
 
@@ -17,7 +21,7 @@ hooks:
 A document with sections carries a table of contents right under its title,
 so a reader — human or agent — sees the shape of the document before the
 first section and can jump to any of them. The rules below say what that
-ToC is, when a file needs one, and how the hook bundled here holds you to
+ToC is, when a file needs one, and how the hooks bundled here hold you to
 it.
 
 ## What the ToC is
@@ -78,19 +82,33 @@ decision:
 
 - `toc: false` in the YAML frontmatter, for a file that has one (specs
   under `.spec/` and `.spec-inbox/` all do);
-- `<!-- toc: off -->` anywhere in the file otherwise.
+- `<!-- toc: off -->` anywhere in the file otherwise;
+- a line in the project's `.claude/md-toc-blacklist.txt`, for a file the
+  project cannot annotate — a `CHANGELOG.md` kept in Keep a Changelog form,
+  a generated file, a vendored one. The checker uses the nearest such list
+  above the file. Each line is a glob relative to the directory that holds
+  `.claude/`, `*` crosses directory separators, a pattern with no `/` also
+  matches the file's name alone (`CHANGELOG.md` covers every changelog in
+  the tree), and `#` starts a comment.
 
-Do not add either on your own judgement; a document you think is too small
-either falls under the three-heading threshold or gets a ToC.
+Do not add any of these on your own judgement; a document you think is too
+small either falls under the three-heading threshold or gets a ToC.
 
-## The hook
+## The hooks
 
 Every `Edit`, `Write` or `MultiEdit` of a `.md` file runs
-`scripts/check_toc.py --hook`. When the file needs a ToC and its ToC is
-missing, incomplete or stale, the hook answers with the list of problems —
-each unlinked heading with its line and anchor, each dead link — and you
-fix the file before moving on. A file that passes, opts out, or needs no
-ToC produces no output.
+`scripts/check_toc.py --hook`, which only notes the file for the session
+and says nothing, so a document restructured over many edits draws no
+comment while it is in flux. When you finish your turn, the `Stop` hook
+runs `scripts/check_toc.py --stop-hook`, which checks every file noted for
+the session. When any of them needs a ToC and its ToC is missing,
+incomplete or stale, the hook keeps the turn going with one message
+listing, per file, each unlinked heading with its line and anchor and each
+dead link; fix every file it names, then finish. A file that passes, opts
+out, is listed in the project's blacklist, or needs no ToC is not
+mentioned. The hook asks once per turn: when the turn is already the
+continuation it asked for, a file that still fails is reported to the user
+and the turn ends.
 
 The same script checks files from the command line for CI or a quick
 audit:

@@ -3,6 +3,7 @@ Tests for scripts/check_toc.py.
 """
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -19,6 +20,35 @@ def write(tmp_path: Path, text: str, name: str = "doc.md") -> Path:
     path = tmp_path / name
     path.write_text(text, encoding="utf-8")
     return path
+
+
+def run_hook(mode: str, call, tmp_path: Path) -> str:
+    """
+    Run the script in hook mode `mode` with `call` on stdin (a dict, or raw
+    text) and the session state kept under `tmp_path`; returns stdout.
+    """
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT), mode],
+        input=call if isinstance(call, str) else json.dumps(call),
+        capture_output=True,
+        text=True,
+        check=True,
+        env={**os.environ, "TMPDIR": str(tmp_path)},
+    )
+    return result.stdout
+
+
+def edit(path: Path, tmp_path: Path, session: str = "s1") -> str:
+    return run_hook(
+        "--hook",
+        {"session_id": session, "tool_name": "Edit", "tool_input": {"file_path": str(path)}},
+        tmp_path,
+    )
+
+
+def stop(tmp_path: Path, session: str = "s1", active: bool = False) -> str:
+    call = {"session_id": session, "hook_event_name": "Stop", "stop_hook_active": active}
+    return run_hook("--stop-hook", call, tmp_path)
 
 
 COMPLETE = """\
@@ -107,6 +137,53 @@ def test_opt_out(tmp_path: Path, text: str) -> None:
     assert check_toc.check(write(tmp_path, text)) == []
 
 
+NEEDS_TOC = "# T\n\n## A\n\n## B\n\n## C\n"
+
+
+def test_blacklist_exempts_the_files_it_lists(tmp_path: Path) -> None:
+    listing = tmp_path / ".claude" / "md-toc-blacklist.txt"
+    listing.parent.mkdir()
+    listing.write_text(
+        "# files kept without a table of contents\n\nCHANGELOG.md\ngenerated/*.md\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "generated" / "deep").mkdir(parents=True)
+    (tmp_path / "sub").mkdir()
+
+    exempt = [
+        write(tmp_path, NEEDS_TOC, "CHANGELOG.md"),
+        write(tmp_path / "sub", NEEDS_TOC, "CHANGELOG.md"),
+        write(tmp_path / "generated", NEEDS_TOC, "api.md"),
+        write(tmp_path / "generated" / "deep", NEEDS_TOC, "api.md"),
+    ]
+    for path in exempt:
+        assert check_toc.check(path) == [], path
+
+    checked = write(tmp_path / "sub", NEEDS_TOC, "notes.md")
+    assert any("no table of contents" in problem for problem in check_toc.check(checked))
+
+
+def test_nearest_blacklist_wins(tmp_path: Path) -> None:
+    outer = tmp_path / ".claude"
+    outer.mkdir()
+    (outer / "md-toc-blacklist.txt").write_text("*.md\n", encoding="utf-8")
+    inner = tmp_path / "project" / ".claude"
+    inner.mkdir(parents=True)
+    (inner / "md-toc-blacklist.txt").write_text("README.md\n", encoding="utf-8")
+
+    assert check_toc.check(write(tmp_path / "project", NEEDS_TOC, "README.md")) == []
+    checked = write(tmp_path / "project", NEEDS_TOC, "doc.md")
+    assert check_toc.check(checked) != []
+
+
+def test_hooks_are_silent_for_a_blacklisted_file(tmp_path: Path) -> None:
+    (tmp_path / ".claude").mkdir()
+    (tmp_path / ".claude" / "md-toc-blacklist.txt").write_text("CHANGELOG.md\n", encoding="utf-8")
+    path = write(tmp_path, NEEDS_TOC, "CHANGELOG.md")
+    assert edit(path, tmp_path) == ""
+    assert stop(tmp_path) == ""
+
+
 def test_headings_in_code_fences_are_ignored(tmp_path: Path) -> None:
     text = (
         "# T\n\n- [A](#a)\n- [B](#b)\n- [C](#c)\n\n## A\n\n```\n## not a heading\n```\n\n"
@@ -126,52 +203,84 @@ def test_print_renders_nested_list(tmp_path: Path, capsys: pytest.CaptureFixture
     assert capsys.readouterr().out == "- [A](#a)\n  - [A.1](#a1)\n- [B](#b)\n"
 
 
-def test_hook_blocks_with_the_problems(tmp_path: Path) -> None:
-    path = write(tmp_path, "# T\n\n## A\n\n## B\n\n## C\n")
-    call = {"tool_name": "Write", "tool_input": {"file_path": str(path)}}
-    result = subprocess.run(
-        [sys.executable, str(SCRIPT), "--hook"],
-        input=json.dumps(call),
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    answer = json.loads(result.stdout)
+def test_edits_are_silent_and_stop_blocks_once_per_file(tmp_path: Path) -> None:
+    bad = write(tmp_path, NEEDS_TOC, "bad.md")
+    other = write(tmp_path, "# T\n\n- [A](#a)\n\n## A\n\n## B\n", "other.md")
+    good = write(tmp_path, COMPLETE, "good.md")
+    for path in (bad, bad, other, good, bad):
+        assert edit(path, tmp_path) == ""
+
+    answer = json.loads(stop(tmp_path))
     assert answer["decision"] == "block"
-    assert "no table of contents" in answer["reason"]
-    assert "--print" in answer["reason"]
+    reason = answer["reason"]
+    assert reason.count("bad.md:") == 1
+    assert reason.count("other.md:") == 1
+    assert "good.md" not in reason
+    assert "no table of contents" in reason
+    assert '"## B" (line 7)' in reason
+    assert "--print" in reason
+
+
+def test_stop_forgets_files_that_pass_and_keeps_the_rest(tmp_path: Path) -> None:
+    bad = write(tmp_path, NEEDS_TOC, "bad.md")
+    fixed = write(tmp_path, NEEDS_TOC, "fixed.md")
+    edit(bad, tmp_path)
+    edit(fixed, tmp_path)
+    assert json.loads(stop(tmp_path))["decision"] == "block"
+
+    fixed.write_text(COMPLETE, encoding="utf-8")
+    answer = json.loads(stop(tmp_path))
+    assert answer["decision"] == "block"
+    assert "bad.md:" in answer["reason"]
+    assert "fixed.md" not in answer["reason"]
+
+    bad.write_text(COMPLETE, encoding="utf-8")
+    assert stop(tmp_path) == ""
+    assert stop(tmp_path) == ""
+
+
+def test_stop_reports_to_the_user_instead_of_blocking_again(tmp_path: Path) -> None:
+    bad = write(tmp_path, NEEDS_TOC, "bad.md")
+    edit(bad, tmp_path)
+    assert json.loads(stop(tmp_path))["decision"] == "block"
+
+    answer = json.loads(stop(tmp_path, active=True))
+    assert "decision" not in answer
+    assert "bad.md" in answer["systemMessage"]
+    assert stop(tmp_path) == ""
+
+
+def test_sessions_keep_separate_notes(tmp_path: Path) -> None:
+    bad = write(tmp_path, NEEDS_TOC, "bad.md")
+    edit(bad, tmp_path, session="a")
+    assert stop(tmp_path, session="b") == ""
+    assert json.loads(stop(tmp_path, session="a"))["decision"] == "block"
+
+
+def test_stop_forgets_a_deleted_file(tmp_path: Path) -> None:
+    bad = write(tmp_path, NEEDS_TOC, "bad.md")
+    edit(bad, tmp_path)
+    bad.unlink()
+    assert stop(tmp_path) == ""
 
 
 @pytest.mark.parametrize(
     "call",
     [
-        {"tool_name": "Write", "tool_input": {"file_path": "/tmp/x.py"}},
-        {"tool_name": "Write", "tool_input": {"file_path": "/nonexistent/doc.md"}},
-        {"tool_name": "Bash", "tool_input": {"command": "ls"}},
+        {"session_id": "s1", "tool_name": "Write", "tool_input": {"file_path": "/tmp/x.py"}},
+        {"session_id": "s1", "tool_name": "Write", "tool_input": {"file_path": "/nonexistent/doc.md"}},
+        {"session_id": "s1", "tool_name": "Bash", "tool_input": {"command": "ls"}},
     ],
 )
-def test_hook_is_silent_for_other_calls(call: dict) -> None:
-    result = subprocess.run(
-        [sys.executable, str(SCRIPT), "--hook"],
-        input=json.dumps(call),
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    assert result.stdout == ""
+def test_hook_notes_nothing_for_other_calls(call: dict, tmp_path: Path) -> None:
+    assert run_hook("--hook", call, tmp_path) == ""
+    assert not (tmp_path / "md-toc").exists()
 
 
-def test_hook_is_silent_for_a_passing_file(tmp_path: Path) -> None:
+def test_hooks_are_silent_for_a_passing_file(tmp_path: Path) -> None:
     path = write(tmp_path, COMPLETE)
-    call = {"tool_name": "Edit", "tool_input": {"file_path": str(path)}}
-    result = subprocess.run(
-        [sys.executable, str(SCRIPT), "--hook"],
-        input=json.dumps(call),
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    assert result.stdout == ""
+    assert edit(path, tmp_path) == ""
+    assert stop(tmp_path) == ""
 
 
 def test_cli_report_exits_nonzero(tmp_path: Path) -> None:
@@ -187,12 +296,6 @@ def test_cli_report_exits_nonzero(tmp_path: Path) -> None:
     assert "good.md" not in result.stdout
 
 
-def test_hook_ignores_garbage_stdin() -> None:
-    result = subprocess.run(
-        [sys.executable, str(SCRIPT), "--hook"],
-        input="not json",
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    assert result.stdout == ""
+@pytest.mark.parametrize("mode", ["--hook", "--stop-hook"])
+def test_hooks_ignore_garbage_stdin(mode: str, tmp_path: Path) -> None:
+    assert run_hook(mode, "not json", tmp_path) == ""

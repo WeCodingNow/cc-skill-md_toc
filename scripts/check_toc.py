@@ -9,15 +9,31 @@ there, and every link there must point at a heading. Anchors are GitHub and
 GitLab slugs of the heading text.
 
 A file opts out with `toc: false` in its YAML frontmatter or an
-`<!-- toc: off -->` comment anywhere in it.
+`<!-- toc: off -->` comment anywhere in it. A project opts files out
+without touching them through `.claude/md-toc-blacklist.txt`: the checker
+looks for that file in the checked file's directory and its ancestors, and
+the nearest one it finds lists glob patterns, one per line, relative to the
+directory holding `.claude/`; a pattern without a `/` also matches the
+file's name alone. Blank lines and lines starting with `#` are ignored.
+
+The two hook modes split the work between a Claude Code session's tool
+calls and the end of its turn, so the agent hears about a file once, after
+it has finished editing, and not after each edit along the way. `--hook`
+runs on PostToolUse and only notes which .md file the call wrote, in a
+per-session file under the temp directory. `--stop-hook` runs on Stop,
+checks every file noted for the session, and answers with one `block`
+decision listing the problems of every file that fails. When the turn is
+already the continuation a Stop hook asked for, the check does not block
+again: it reports what is still wrong to the user and lets the turn end.
 
 Usage:
   check_toc.py FILE...        report on each file; exit 1 if any fails
   check_toc.py --print FILE   print the ToC list FILE should carry
-  check_toc.py --hook         Claude Code PostToolUse hook: read the tool
-                              call as JSON on stdin, check the edited .md
-                              file, and answer with a `block` decision that
-                              tells the agent what to fix
+  check_toc.py --hook         PostToolUse hook: read the tool call as JSON
+                              on stdin and note the .md file it wrote
+  check_toc.py --stop-hook    Stop hook: check the files noted for the
+                              session and answer with a `block` decision
+                              that tells the agent what to fix
 """
 
 from __future__ import annotations
@@ -25,11 +41,17 @@ from __future__ import annotations
 import json
 import re
 import sys
+import tempfile
 from dataclasses import dataclass
+from fnmatch import fnmatchcase
 from pathlib import Path
 
 # Headings below the first H1 from which a ToC is required.
 MIN_HEADINGS = 3
+
+# The per-project list of files the checker leaves alone, relative to the
+# directory that holds it; the nearest one above the checked file applies.
+BLACKLIST = Path(".claude") / "md-toc-blacklist.txt"
 
 HEADING = re.compile(r"^(#{1,6})[ \t]+(.*?)[ \t]*#*[ \t]*$")
 FENCE = re.compile(r"^(```|~~~)")
@@ -84,6 +106,44 @@ def opted_out(text: str, lines: list[str]) -> bool:
     end = frontmatter_end(lines)
     front = "\n".join(lines[:end])
     return bool(OPT_OUT_FRONTMATTER.search(front) or OPT_OUT_COMMENT.search(text))
+
+
+def blacklist_patterns(path: Path) -> tuple[Path, list[str]] | None:
+    """
+    The directory whose `.claude/md-toc-blacklist.txt` is the nearest one
+    above `path`, with the patterns that file lists; `None` when no ancestor
+    has one.
+    """
+    for root in path.resolve().parents:
+        listing = root / BLACKLIST
+        if not listing.is_file():
+            continue
+        patterns = []
+        for line in listing.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                patterns.append(line)
+        return root, patterns
+    return None
+
+
+def blacklisted(path: Path) -> bool:
+    """
+    Whether the nearest `.claude/md-toc-blacklist.txt` above `path` lists
+    it. A pattern is matched against the path relative to the directory
+    holding `.claude/`, with `*` crossing directory separators; a pattern
+    without a `/` is matched against the file's name as well.
+    """
+    found = blacklist_patterns(path)
+    if found is None:
+        return False
+    root, patterns = found
+    relative = path.resolve().relative_to(root).as_posix()
+    return any(
+        fnmatchcase(relative, pattern)
+        or ("/" not in pattern and fnmatchcase(path.name, pattern))
+        for pattern in patterns
+    )
 
 
 def headings(lines: list[str], start: int) -> list[Heading]:
@@ -145,7 +205,7 @@ def check(path: Path) -> list[str]:
     """
     text = path.read_text(encoding="utf-8")
     lines = text.splitlines()
-    if opted_out(text, lines):
+    if opted_out(text, lines) or blacklisted(path):
         return []
     all_headings = headings(lines, frontmatter_end(lines))
     first_h1 = next((heading for heading in all_headings if heading.level == 1), None)
@@ -200,16 +260,32 @@ def report(paths: list[Path]) -> int:
     return 1 if failed else 0
 
 
-def hook() -> int:
-    """
-    Read a Claude Code tool call from stdin and check the markdown file it
-    wrote. A file that fails comes back as a `block` decision whose reason
-    lists what to fix; anything else is silent.
-    """
+def read_hook_input() -> dict:
+    """The JSON Claude Code passes a hook on stdin; empty when it is not JSON."""
     try:
         call = json.load(sys.stdin)
     except json.JSONDecodeError:
-        return 0
+        return {}
+    return call if isinstance(call, dict) else {}
+
+
+def noted_files(call: dict) -> Path:
+    """
+    The file that lists the markdown files written during the session `call`
+    belongs to, one absolute path per line. It lives under the temp
+    directory, so a session that ends without a Stop hook leaves nothing
+    that outlives a reboot.
+    """
+    session = re.sub(r"[^\w.-]", "_", str(call.get("session_id") or "default"))
+    return Path(tempfile.gettempdir()) / "md-toc" / session
+
+
+def hook() -> int:
+    """
+    Note the markdown file the tool call on stdin wrote, for the Stop hook
+    to check. Calls that wrote no existing `.md` file leave no trace.
+    """
+    call = read_hook_input()
     tool_input = call.get("tool_input") or {}
     file_path = tool_input.get("file_path")
     if not file_path or not file_path.endswith(".md"):
@@ -217,18 +293,45 @@ def hook() -> int:
     path = Path(file_path)
     if not path.is_file():
         return 0
-    problems = check(path)
-    if not problems:
+    noted = noted_files(call)
+    noted.parent.mkdir(parents=True, exist_ok=True)
+    with noted.open("a", encoding="utf-8") as out:
+        out.write(f"{path.resolve()}\n")
+    return 0
+
+
+def stop_hook() -> int:
+    """
+    Check every markdown file noted for the session and answer with one
+    `block` decision listing the problems of each file that fails. A file
+    that passes, or is gone, is forgotten. When the turn is already the
+    continuation a Stop hook asked for, the agent has had its round of
+    fixes: the files that still fail are reported to the user with a
+    `systemMessage`, forgotten, and the turn ends.
+    """
+    call = read_hook_input()
+    noted = noted_files(call)
+    if not noted.is_file():
         return 0
+    lines = noted.read_text(encoding="utf-8").splitlines()
+    paths = [Path(line) for line in dict.fromkeys(lines) if line]
+    failing = [(path, check(path)) for path in paths if path.is_file()]
+    failing = [(path, problems) for path, problems in failing if problems]
+    if not failing or call.get("stop_hook_active"):
+        noted.unlink()
+        if failing:
+            names = ", ".join(str(path) for path, _ in failing)
+            print(json.dumps({"systemMessage": f"md-toc: table of contents still wrong in {names}"}))
+        return 0
+    noted.write_text("".join(f"{path}\n" for path, _ in failing), encoding="utf-8")
     script = Path(__file__).resolve()
-    reason = (
-        f"{path} needs its table of contents fixed:\n"
-        + "\n".join(f"- {problem}" for problem in problems)
-        + "\n\nThe ToC is the nested bullet list of `[Heading](#anchor)` links right under "
-        f"the first H1, before the first H2, listing every heading below the H1. Run "
-        f"`python3 {script} --print {path}` to get the complete list and put it there. "
-        "If the user said this file needs no ToC, add `toc: false` to its frontmatter "
-        "or an `<!-- toc: off -->` comment instead."
+    reason = "Fix the table of contents of the markdown files you edited before you finish:\n" + "".join(
+        f"\n{path}:\n" + "".join(f"- {problem}\n" for problem in problems) for path, problems in failing
+    ) + (
+        f"\nRun `python3 {script} --print FILE` for the complete list a file should carry and put "
+        "it right under the H1, before the first H2. A file the user said needs no ToC gets "
+        "`toc: false` in its frontmatter, an `<!-- toc: off -->` comment, or a pattern in the "
+        f"project's `{BLACKLIST.as_posix()}` instead."
     )
     print(json.dumps({"decision": "block", "reason": reason}))
     return 0
@@ -237,6 +340,8 @@ def hook() -> int:
 def main(argv: list[str]) -> int:
     if argv == ["--hook"]:
         return hook()
+    if argv == ["--stop-hook"]:
+        return stop_hook()
     if len(argv) == 2 and argv[0] == "--print":
         return print_toc(Path(argv[1]))
     if argv and not argv[0].startswith("-"):
